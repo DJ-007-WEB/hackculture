@@ -1,0 +1,374 @@
+import { useState, useEffect } from 'react'
+import { apiFetch } from '../App'
+import KpiCard from '../components/KpiCard'
+import Modal from '../components/Modal'
+import FreezeOverlay from '../components/FreezeOverlay'
+import JustifyModal from '../components/JustifyModal'
+import { Landmark, ArrowRightLeft, Coins, Activity, Clock, ShieldAlert, BadgeInfo, Zap } from 'lucide-react'
+
+const formatINR = (n) => `₹${Number(n).toLocaleString('en-IN')}`
+
+export default function Treasury() {
+  const [stats, setStats] = useState({})
+  const [transactions, setTransactions] = useState([])
+  const [accounts, setAccounts] = useState([])
+  const [showTransfer, setShowTransfer] = useState(false)
+  const [blockModal, setBlockModal] = useState(null)
+  const [toast, setToast] = useState(null)
+  const [formData, setFormData] = useState({})
+  const [submitting, setSubmitting] = useState(false)
+
+  // Tier-aware state
+  const [freezeOverlay, setFreezeOverlay] = useState(null)  // { mode, data }
+  const [justifyModal, setJustifyModal] = useState(null)     // { data, pendingAction }
+  const [pendingAction, setPendingAction] = useState(null)   // { type, body }
+  const [deniedModal, setDeniedModal] = useState(null)
+  const [structuringDelay, setStructuringDelay] = useState(0) // 30s counter
+  const [blockScreen, setBlockScreen] = useState(false)
+  const [structPendingSuccess, setStructPendingSuccess] = useState(null)
+
+  const load = () => {
+    apiFetch('/api/treasury/stats').then(setStats).catch(console.error)
+    apiFetch('/api/treasury/transactions?limit=15').then(d => setTransactions(d.transactions)).catch(console.error)
+    apiFetch('/api/treasury/balances').then(d => setAccounts(d.accounts)).catch(console.error)
+  }
+  useEffect(load, [])
+
+  const showToast = (msg, type = 'success') => { setToast({ msg, type }); setTimeout(() => setToast(null), 4000) }
+
+  const handleSecurityResponse = (err, actionType, actionBody) => {
+    const data = err.data || err
+
+    // Tier 2: Justification required
+    if (data.justify_required) {
+      setJustifyModal({ data })
+      setPendingAction({ type: actionType, body: actionBody })
+      return
+    }
+
+    // Tier 3: MFA required
+    if (data.mfa_required || data.step_up_required) {
+      setFreezeOverlay({ mode: 'mfa', data })
+      setPendingAction({ type: actionType, body: actionBody })
+      return
+    }
+
+    // Tier 4: Admin approval required
+    if (data.admin_approval_required) {
+      setFreezeOverlay({ mode: 'admin', data })
+      setPendingAction({ type: actionType, body: actionBody })
+      return
+    }
+
+    // Legacy block handling
+    if (data.blocked) {
+      setBlockModal(data)
+      return
+    }
+
+    // Generic error
+    showToast(data.message || err.message || 'An error occurred', 'error')
+  }
+
+
+
+  const handleTransfer = async () => {
+    setSubmitting(true)
+    const body = { from_account_id: formData.from_account_id, to_account_id: formData.to_account_id, amount: Number(formData.amount), description: formData.description }
+    try {
+      const res = await apiFetch('/api/treasury/transfer', { method: 'POST', body: JSON.stringify(body) })
+      
+      if (res.structuringFlag) {
+        if (res.matchCount >= 3) {
+          setShowTransfer(false)
+          setBlockScreen(true)
+          return
+        } else if (res.matchCount === 2) {
+          setShowTransfer(false)
+          setStructuringDelay(30)
+          setStructPendingSuccess(res.message || 'Transfer completed successfully')
+          return
+        } else if (res.matchCount === 1) {
+          showToast("Repeated transaction detected. If this wasn't intentional, please contact support.", 'warning')
+        }
+      }
+
+      if (res.justify_required || res.mfa_required || res.step_up_required || res.admin_approval_required) {
+        handleSecurityResponse(res, 'transfer', body)
+        setShowTransfer(false)
+        return
+      }
+      if (res.matchCount !== 1) {
+        showToast(res.message)
+      }
+      setShowTransfer(false); setFormData({}); load()
+    } catch (err) {
+      setShowTransfer(false)
+      handleSecurityResponse(err, 'transfer', body)
+    } finally { setSubmitting(false) }
+  }
+
+  // Retry action after MFA/approval success
+  const retryPendingAction = async () => {
+    if (!pendingAction) {
+      setFreezeOverlay(null)
+      return
+    }
+    setFreezeOverlay(null)
+    setSubmitting(true)
+    try {
+      const endpoint = pendingAction.type === 'withdraw' ? '/api/treasury/withdraw' : '/api/treasury/transfer'
+      const res = await apiFetch(endpoint, {
+        method: 'POST',
+        body: JSON.stringify(pendingAction.body),
+        headers: { 'X-Device': 'internal workstation' }
+      })
+      if (res.justify_required || res.mfa_required || res.step_up_required || res.admin_approval_required) {
+        showToast('Action still requires additional verification', 'error')
+      } else {
+        showToast(res.message || 'Action completed successfully')
+        load()
+      }
+    } catch (err) {
+      showToast('Action could not be completed: ' + (err.message || 'Unknown error'), 'error')
+    } finally {
+      setSubmitting(false)
+      setPendingAction(null)
+    }
+  }
+
+  // Handle justification submit
+  const handleJustifySubmit = async (reason) => {
+    showToast(`Justification submitted: "${reason}"`)
+    setJustifyModal(null)
+    if (pendingAction) {
+      // Retry the action with the device header set to known device to lower the score
+      setSubmitting(true)
+      try {
+        const endpoint = pendingAction.type === 'withdraw' ? '/api/treasury/withdraw' : '/api/treasury/transfer'
+        const res = await apiFetch(endpoint, {
+          method: 'POST',
+          body: JSON.stringify({ ...pendingAction.body, details: `Justified: ${reason}` }),
+          headers: { 'X-Device': 'internal workstation' }
+        })
+        if (res.justify_required || res.mfa_required || res.step_up_required || res.admin_approval_required) {
+          handleSecurityResponse(res, pendingAction.type, pendingAction.body)
+        } else {
+          showToast(res.message || 'Action completed successfully')
+          load()
+        }
+      } catch (err) {
+        handleSecurityResponse(err, pendingAction.type, pendingAction.body)
+      } finally {
+        setSubmitting(false)
+        setPendingAction(null)
+      }
+    }
+  }
+
+  const statusBadge = (s) => {
+    const map = { completed: 'success', pending: 'warning', blocked: 'danger', flagged: 'warning', rejected: 'danger' }
+    return <span className={`badge ${map[s] || 'neutral'}`}>{s}</span>
+  }
+
+  // Structuring delay timer effect
+  useEffect(() => {
+    let interval = null;
+    if (structuringDelay > 0) {
+      interval = setInterval(() => {
+        setStructuringDelay((d) => {
+          if (d <= 1) {
+            clearInterval(interval);
+            showToast(structPendingSuccess);
+            setFormData({}); load();
+            return 0;
+          }
+          return d - 1;
+        });
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [structuringDelay, structPendingSuccess]);
+
+  if (blockScreen) {
+    return (
+      <div style={{ position: 'fixed', top: 0, left: 0, width: '100%', height: '100%', backgroundColor: 'rgba(20, 0, 0, 0.95)', zIndex: 99999, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column' }}>
+        <ShieldAlert size={64} color="var(--danger)" style={{ marginBottom: '24px' }} />
+        <h1 style={{ color: '#fff', fontSize: '32px', marginBottom: '16px' }}>Account Temporarily Suspended</h1>
+        <p style={{ color: '#ccc', fontSize: '18px', maxWidth: '600px', textAlign: 'center', marginBottom: '40px' }}>
+          Suspicious repetitive transaction activity has been detected. Your account is under review. Reference: TXN-{Date.now()}. Contact support to appeal.
+        </p>
+        <button className="btn btn-primary" style={{ padding: '12px 32px', fontSize: '18px' }} onClick={() => window.location.reload()}>Contact Support</button>
+      </div>
+    )
+  }
+
+  return (
+    <div>
+      <div className="hero-landing-section">
+        <div className="hero-card">
+          <h3>Treasury & Settlement Operations</h3>
+          <p>Manage institutional fund flows, inter-branch settlements, and RTGS/NEFT processing. All transfers are subject to real-time fraud scoring per RBI guidelines.</p>
+        </div>
+      </div>
+
+      <div className="kpi-grid">
+        <KpiCard icon={<Coins size={24} />} label="Aggregate Position" value={formatINR(stats.totalBalance || 0)} color="blue" change="↑ 2.4% from yesterday" />
+        <KpiCard icon={<Activity size={24} />} label="Today's Throughput" value={formatINR(stats.dailyVolume || 0)} color="green" />
+        <KpiCard icon={<Clock size={24} />} label="Pending Clearance" value={stats.pendingApprovals || 0} color="orange" />
+        <KpiCard icon={<ShieldAlert size={24} />} label="Held by Compliance" value={stats.blockedTransactions || 0} color="red" />
+      </div>
+
+      <div className="grid-2">
+        <div className="card">
+          <div className="card-header">
+            <h3>Nostro / Vostro Balances</h3>
+          </div>
+          <div className="card-body" style={{padding: 0}}>
+            <div className="table-wrapper">
+              <table>
+                <thead><tr><th>Account</th><th>Type</th><th className="text-right">Balance</th></tr></thead>
+                <tbody>
+                  {accounts.map(a => (
+                    <tr key={a.id}>
+                      <td><strong>{a.account_name}</strong><br/><span style={{fontSize:'12px', color:'var(--text-muted)'}}>{a.id}</span></td>
+                      <td><span className="badge neutral">{a.account_type}</span></td>
+                      <td className="text-right amount">{formatINR(a.balance)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div className="card">
+            <div className="card-header"><h3>Quick Actions</h3></div>
+            <div className="card-body" style={{display:'flex', flexDirection:'column', gap:'12px'}}>
+              <button className="btn btn-outline" onClick={() => { setFormData({}); setShowTransfer(true) }}><ArrowRightLeft size={16} /> RTGS / Internal Transfer</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+         <div className="card-header"><h3>Transaction Ledger (Last 15)</h3></div>
+        <div className="card-body" style={{padding: 0}}>
+          <div className="table-wrapper">
+            <table>
+               <thead><tr><th>Txn Ref</th><th>Account</th><th>Channel</th><th className="text-right">Amount</th><th>Narration</th><th>Status</th><th>Value Date</th></tr></thead>
+              <tbody>
+                {transactions.map(tx => (
+                  <tr key={tx.id}>
+                    <td style={{fontFamily:'monospace', fontSize:'13px'}}>{tx.id}</td>
+                    <td>{tx.account_name || tx.account_id}</td>
+                    <td><span className="badge info">{tx.type}</span></td>
+                    <td className="text-right amount">{formatINR(tx.amount)}</td>
+                    <td style={{maxWidth:'200px', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap'}}>{tx.description}</td>
+                    <td>{statusBadge(tx.status)}</td>
+                    <td style={{fontSize:'13px', color:'var(--text-muted)', whiteSpace:'nowrap'}}>
+                      {tx.created_at ? new Date((typeof tx.created_at === 'string' && tx.created_at.includes(' ') && !tx.created_at.includes('Z')) ? tx.created_at.replace(' ', 'T') + 'Z' : tx.created_at).toLocaleString() : '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      {/* Transfer Modal */}
+      <Modal show={showTransfer} onClose={() => setShowTransfer(false)} title="Internal Transfer" icon={<ArrowRightLeft size={20} />}
+        footer={<><button className="btn btn-outline" onClick={() => setShowTransfer(false)}>Cancel</button>
+          <button className="btn btn-primary" onClick={handleTransfer} disabled={submitting}>{submitting ? 'Processing...' : 'Submit Transfer'}</button></>}>
+        <div className="form-group">
+          <label>From Account</label>
+          <select className="form-select" value={formData.from_account_id || ''} onChange={e => setFormData({...formData, from_account_id: e.target.value})}>
+            <option value="">Select source</option>
+            {accounts.map(a => <option key={a.id} value={a.id}>{a.account_name} ({formatINR(a.balance)})</option>)}
+          </select>
+        </div>
+        <div className="form-group">
+          <label>To Account</label>
+          <select className="form-select" value={formData.to_account_id || ''} onChange={e => setFormData({...formData, to_account_id: e.target.value})}>
+            <option value="">Select destination</option>
+            {accounts.map(a => <option key={a.id} value={a.id}>{a.account_name}</option>)}
+          </select>
+        </div>
+        <div className="form-group">
+          <label>Amount (₹)</label>
+          <input className="form-input" type="number" value={formData.amount || ''} onChange={e => setFormData({...formData, amount: e.target.value})} placeholder="Enter amount" />
+        </div>
+        <div className="form-group">
+          <label>Description</label>
+          <input className="form-input" value={formData.description || ''} onChange={e => setFormData({...formData, description: e.target.value})} placeholder="Transfer note" />
+        </div>
+      </Modal>
+
+      {/* 30s Structuring Delay Modal */}
+      <Modal show={structuringDelay > 0} onClose={() => setStructuringDelay(0)} title="Security Review Pending" icon={<Clock size={20} color="var(--warning)" />}
+        footer={<button className="btn btn-outline" onClick={() => { setStructuringDelay(0); showToast('Transfer cancelled locally.'); }}>Cancel Transaction</button>}>
+        <div style={{ textAlign: 'center', padding: '24px' }}>
+          <h2 style={{ fontSize: '48px', margin: '0 0 16px 0', fontFamily: 'monospace', color: 'var(--warning)' }}>00:{structuringDelay.toString().padStart(2, '0')}</h2>
+          <p style={{ color: 'var(--text-secondary)' }}>This is your 3rd repeated transaction pattern within 24 hours. It will be processed after a 30-second security review.</p>
+        </div>
+      </Modal>
+
+      {/* Legacy Security Block Modal (fallback) */}
+      <Modal show={!!blockModal} onClose={() => setBlockModal(null)}
+        title="Transaction Blocked" icon={<ShieldAlert size={20}/>}
+        footer={<button className="btn btn-outline" onClick={() => setBlockModal(null)}>Close</button>}>
+        {blockModal && (
+          <>
+            <div className="alert-block danger">
+              <span className="alert-icon"><ShieldAlert size={18}/></span>
+              <div className="alert-text">
+                <div className="alert-title">{blockModal.message}</div>
+                <div>{blockModal.reason}</div>
+              </div>
+            </div>
+          </>
+        )}
+      </Modal>
+
+      {/* Tier 2: Justification Modal */}
+      <JustifyModal
+        show={!!justifyModal}
+        data={justifyModal?.data}
+        onSubmit={handleJustifySubmit}
+        onClose={() => { setJustifyModal(null); setPendingAction(null) }}
+      />
+
+      {/* Tier 3 & 4: Freeze Overlay */}
+      {freezeOverlay && (
+        <FreezeOverlay
+          mode={freezeOverlay.mode}
+          data={freezeOverlay.data}
+          onResolved={() => {
+            setTimeout(() => {
+              retryPendingAction()
+            }, 1500)
+          }}
+          onDenied={() => {
+            setFreezeOverlay(null)
+            setPendingAction(null)
+            setDeniedModal('This action has been permanently blocked by the security administrator.')
+          }}
+        />
+      )}
+
+      <Modal show={!!deniedModal} onClose={() => setDeniedModal(null)} title="Action Denied" icon={<ShieldAlert size={20} color="var(--danger)" />} footer={<button className="btn btn-outline" onClick={() => setDeniedModal(null)}>Close</button>}>
+        <div className="alert-block danger">
+          <span className="alert-icon"><ShieldAlert size={18}/></span>
+          <div className="alert-text">
+            <div className="alert-title">Admin Denial</div>
+            <div>{deniedModal}</div>
+          </div>
+        </div>
+      </Modal>
+
+      {toast && <div className={`toast ${toast.type}`}>{toast.msg}</div>}
+    </div>
+  )
+}
